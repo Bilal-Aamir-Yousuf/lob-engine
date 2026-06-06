@@ -1,13 +1,14 @@
-# lob-engine — High-Frequency Limit Order Book Engine
+# lob-engine: High-Frequency Limit Order Book Engine
 
-A production-grade **C++17** limit order book with **O(1) order insertion and
-cancellation**, realistic order-flow simulation via **Hawkes processes**,
-classic **market-impact models** (Kyle 1985, Almgren-Chriss 2000), a **FIX 4.2
-protocol gateway** for external connectivity, **Python bindings** through
-pybind11, and **benchmark-verified throughput of 8M+ orders per second**.
+A limit order book written in C++17 with O(1) order insertion and cancellation,
+plus the pieces that make it useful for microstructure work: a Hawkes-process
+order-flow simulator, the Kyle (1985) and Almgren-Chriss (2000) impact models, a
+FIX 4.2 gateway, and Python bindings. It sustains over 8 million order operations
+per second on a laptop.
 
-This is the kind of system that sits at the heart of every exchange and quant
-trading firm — built from scratch, fast, and correct.
+The matching core uses the same design real exchanges run on: price-time
+priority over an intrusive linked list, with a hash-map index that makes
+cancellation constant-time.
 
 ```python
 from lob_engine import OrderBook, HawkesSimulator
@@ -27,9 +28,9 @@ print(book.order_book_imbalance(levels=3))
 ## Table of contents
 
 - [Architecture](#architecture)
-- [Why price-time priority + an intrusive linked list](#why-price-time-priority--an-intrusive-linked-list)
-- [Hawkes process order flow (in plain English)](#hawkes-process-order-flow-in-plain-english)
-- [Adverse selection — proof from the simulator](#adverse-selection--proof-from-the-simulator)
+- [Why price-time priority and an intrusive linked list](#why-price-time-priority-and-an-intrusive-linked-list)
+- [Hawkes order flow](#hawkes-order-flow)
+- [Adverse selection: proof from the simulator](#adverse-selection-proof-from-the-simulator)
 - [Market-impact models](#market-impact-models)
 - [FIX protocol gateway](#fix-protocol-gateway)
 - [Benchmarks](#benchmarks)
@@ -76,17 +77,16 @@ print(book.order_book_imbalance(levels=3))
 
 ---
 
-## Why price-time priority + an intrusive linked list
+## Why price-time priority and an intrusive linked list
 
-**Price-time priority** is the matching rule used by virtually every lit
-exchange: orders are filled best-price-first, and within a price, oldest-first
-(FIFO). It is *fair* (no jumping the queue without improving the price) and it
-gives traders a well-defined incentive — to get filled sooner at a given price,
-arrive earlier. Reproducing it correctly is the whole game; everything else is
-performance.
+Price-time priority is the rule almost every lit exchange uses: fill the best
+price first, and within a price, fill the oldest order first (FIFO). It is fair,
+because the only way to jump the queue is to quote a better price, and it gives
+traders a clear incentive to post early. Getting that rule exactly right is the
+point of the engine. The rest is making it fast.
 
-The performance question is: **what data structure holds the resting orders so
-that the three hot operations are each O(1)?**
+So the real question is which data structure holds the resting orders so that the
+three hot operations are each O(1):
 
 | Operation        | What it needs                                  | Our cost |
 |------------------|------------------------------------------------|----------|
@@ -94,92 +94,95 @@ that the three hot operations are each O(1)?**
 | cancel           | find the order, splice it out of its level     | O(1)     |
 | match (best px)  | read the best level, pop from the front        | O(1)     |
 
-\* O(log P) to *locate* the price level in the `std::map` where P = number of
-distinct price levels (tiny and bounded in practice), then O(1) to append.
+\* The asterisk: locating the price level is O(log P) in the `std::map`, where P
+is the number of active price levels (small and bounded in practice). Once you
+have the level, appending is O(1).
 
-The trick that makes **cancellation O(1)** is the pairing of two structures:
+Constant-time cancellation comes from pairing two structures:
 
-1. **`std::unordered_map<order_id, Order*>`** — a global lookup that maps an
-   order id straight to the node's address in constant time.
-2. **An intrusive doubly-linked list** at each price level — because the node
-   *is* the `Order` (the `prev`/`next` pointers live inside the struct), once we
-   have the `Order*` we splice it out in O(1) with no search.
+1. `std::unordered_map<order_id, Order*>` maps an order id straight to its node's
+   address.
+2. An intrusive doubly-linked list at each price level. The node *is* the
+   `Order` (the `prev`/`next` pointers live in the struct), so once the hash map
+   hands back the pointer, unlinking it is a handful of pointer writes with no
+   search.
 
 ### What "intrusive" buys you over the naive version
 
-A naive book stores `std::list<Order>` per level. That means:
+A naive book keeps a `std::list<Order>` per level. Three problems come with that:
 
-- **Every order is a separate heap allocation** (the list node wraps the order).
-  At millions of orders/second, `malloc`/`free` becomes the bottleneck and
-  fragments memory.
-- **Cancellation needs an iterator**, so you store `list::iterator` in the
-  lookup map — workable, but you still pay the per-node allocation.
-- **Cache misses** everywhere: list nodes are scattered across the heap.
+- Every order is its own heap allocation, because the list node wraps the order.
+  At millions of orders a second, `malloc`/`free` becomes the bottleneck and the
+  heap fragments.
+- To cancel, you stash a `list::iterator` in the index. That works, but you are
+  still paying for the per-node allocation.
+- The nodes end up scattered across the heap, so walking a level misses cache
+  constantly.
 
-The intrusive design fixes all three:
+The intrusive version sidesteps all three:
 
-- The `next`/`prev` pointers are **fields of `Order`**, so there is no wrapper
-  node and no extra allocation per order.
-- Orders are handed out from a **free-list `OrderPool`** that allocates in big
-  blocks and recycles freed slots (reusing the `next` pointer as the free-list
-  link). In steady state there are **zero calls to the system allocator** on the
-  hot path.
-- Splicing is four pointer writes. Finding the node is one hash lookup.
+- `prev`/`next` are fields of `Order`, so there is no wrapper node and no
+  separate allocation per order.
+- Orders are handed out by a free-list `OrderPool` that grabs memory in big
+  blocks and recycles freed slots (the freed order's `next` pointer doubles as
+  the free-list link). Once it has warmed up, the hot path never calls the system
+  allocator.
+- Unlinking is four pointer writes, and finding the node is a single hash lookup.
 
-The result is the latency profile in the [benchmarks](#benchmarks): ~90 ns
-median to add a limit order, ~180 ns to cancel, and >8M orders/sec throughput on
+That is where the latency numbers come from (see [benchmarks](#benchmarks)):
+roughly 90 ns to add a limit order, 180 ns to cancel, and north of 8M ops/sec on
 a laptop-class CPU.
 
-> **Why integer ticks?** Prices are stored as `int64_t` ticks (e.g. dollars ×
-> 100), never floats. Floating-point prices break the most fundamental
-> operation in a matching engine — *equality and ordering of price levels* —
-> because `1.10` is not exactly representable. Integers make comparison exact
-> and make `std::map` keys behave.
+> **Why integer ticks?** Prices are `int64_t` ticks (dollars × 100, say), never
+> floats. Floats break the one thing a matching engine cannot get wrong, namely
+> comparing and ordering price levels, because a value like `1.10` has no exact
+> binary representation. Integers keep the comparisons exact and keep `std::map`
+> keys well-behaved.
 
 ---
 
-## Hawkes process order flow (in plain English)
+## Hawkes order flow
 
-Real order flow is **not** a steady drizzle of independent events. It arrives in
-**bursts**: a large sell prints, which spooks other participants into selling,
-which moves the price, which triggers stops and more selling. Trading begets
-trading. Statisticians call a process with this "an event now makes more events
-soon" property **self-exciting**, and the canonical model is the **Hawkes
-process**.
+Real order flow does not arrive as a steady, independent stream. It clusters. A
+big sell prints, that nudges other participants to sell, the price moves, stops
+trigger, and more selling follows. Trades beget trades. The standard way to model
+this "an event now makes more events likely soon" behaviour is a self-exciting
+point process, and the workhorse is the Hawkes process.
 
-We implement a **4-dimensional mutually-exciting** Hawkes process — the four
-dimensions being `market_buy`, `market_sell`, `limit_buy`, `limit_sell`. Each
-type has a **baseline rate** `μ_i` (the background drizzle) and every past event
-*excites* all four future rates through an **excitation matrix** `α`:
+This is a 4-dimensional, mutually-exciting Hawkes process over `market_buy`,
+`market_sell`, `limit_buy`, and `limit_sell`. Each type has a baseline rate
+`μ_i`, and every past event raises all four future rates through an excitation
+matrix `α`:
 
 ```
 λ_i(t) = μ_i + Σ_j Σ_{t_k < t, type=j}  α_ij · β · exp(−β · (t − t_k))
 ```
 
-In words: the current intensity of type *i* is its baseline plus a sum of
-exponentially-decaying "bumps", one for every past event, where a type-*j* event
-bumps type-*i*'s rate by `α_ij`. The bump fades with timescale `1/β`.
+Read it as: the intensity of type *i* right now is its baseline plus a decaying
+bump from every past event, where a type-*j* event raises type-*i*'s rate by
+`α_ij` and the bump fades on a `1/β` timescale.
 
-- `α_ij` is the **branching ratio**: the expected number of type-*i* offspring
-  triggered by one type-*j* event (the kernel `β·exp(−βt)` integrates to 1).
-- **Stationarity** (the process doesn't explode) requires the **spectral radius
-  of `α` to be < 1** — we *enforce* this in the constructor and throw otherwise.
-- The long-run mean rates have a closed form: `λ_∞ = (I − α)⁻¹ μ`.
+- `α_ij` is the branching ratio: the expected number of type-*i* offspring that
+  one type-*j* event sets off (the kernel `β·exp(−βt)` integrates to 1).
+- For the process to stay finite, the spectral radius of `α` has to be below 1.
+  The constructor checks this and throws if it is not.
+- The long-run mean rates are closed-form: `λ_∞ = (I − α)⁻¹ μ`.
 
-Events are generated by **Ogata's thinning algorithm**, which produces an
-*exact* (not discretised) sample path:
+Events come from Ogata's thinning algorithm, which produces an exact sample path
+rather than a time-discretised approximation:
 
-1. Bound the total intensity by its current value `Λ = Σ_i λ_i(t)` (valid
-   because between events the intensity only decays).
+1. Bound the total intensity by its current value `Λ = Σ_i λ_i(t)`. This is valid
+   because between events the intensity only decays.
 2. Draw a candidate time `t + Exponential(1/Λ)`.
-3. Accept the candidate with probability `Λ(t_next)/Λ`; if accepted, pick the
-   event type in proportion to its intensity. Otherwise reject and repeat.
+3. Accept the candidate with probability `Λ(t_next)/Λ`. If accepted, pick the
+   event type in proportion to its intensity, otherwise reject and try again.
 
-Using the exponential kernel's recursive structure, each step is O(4), so we
-simulate hundreds of thousands of events in milliseconds.
+Because the kernel is exponential, the intensity has a simple recursive update,
+so each step is O(4) and the simulator spits out hundreds of thousands of events
+in milliseconds.
 
-**Validation.** Run the simulator for a long horizon and the empirical event
-rates converge to the closed-form stationary intensities:
+**Validation.** Run it for a long horizon and the empirical event rates converge
+to the closed-form stationary intensities:
 
 ```
 [Hawkes validation] empirical vs closed-form rates (T=50000, 248873 events):
@@ -191,18 +194,16 @@ rates converge to the closed-form stationary intensities:
 
 ---
 
-## Adverse selection — proof from the simulator
+## Adverse selection: proof from the simulator
 
-A **latent fundamental price** drifts with **permanent market impact**: each
-market buy nudges it up, each market sell nudges it down. Liquidity providers
-quote limit orders around the (moving) fundamental, so when the fundamental runs
-away from a stale quote, that quote gets **picked off** — this is **adverse
-selection**, the core risk of market making.
+A latent fundamental price drifts with permanent impact: market buys push it up,
+market sells push it down. Liquidity providers quote around that fundamental, so
+when it walks away from a stale quote, the quote gets picked off. That is adverse
+selection, the basic risk of making markets.
 
-If the simulator is realistic, signed order flow should *predict* price moves in
-the same direction. We test this directly by regressing the per-bucket mid-price
-change on the contemporaneous **net market order flow** (this slope is exactly
-**Kyle's λ**):
+If the simulation is any good, signed order flow should predict price moves in the
+same direction. The check is a regression of the per-bucket mid-price change on
+the contemporaneous net market order flow. That slope is Kyle's λ:
 
 ```
 [Adverse selection] OLS  mid_change ~ net_order_flow
@@ -213,47 +214,46 @@ change on the contemporaneous **net market order flow** (this slope is exactly
   n (buckets)               = 49998
 ```
 
-The slope is **positive and overwhelmingly significant (t ≈ 9.4)** — net buying
-pressure moves the price up against resting liquidity, exactly as theory
-predicts. The small R² is itself realistic: at high frequency, microstructure
-noise dominates the *variance* of returns while the systematic impact is small
-but rock-solid in *expectation*.
+The slope is positive with a t-stat around 9.4, so net buying reliably pushes the
+price up against resting liquidity, which is exactly what the theory predicts.
+The R² is tiny, and that is expected: at this frequency, microstructure noise
+swamps the variance of returns even though the impact is dead-on in expectation.
 
 ---
 
 ## Market-impact models
 
-### Kyle (1985) — market depth λ
+### Kyle (1985): market depth λ
 
-In Kyle's model the price is linear in signed order flow, `Δp = λ · q + noise`,
-and the depth coefficient is estimated as
+Kyle's model makes price linear in signed order flow, `Δp = λ · q + noise`, so the
+depth coefficient is
 
 ```
 λ = Cov(Δp, q) / Var(q)
 ```
 
-λ is the price move per unit of net order flow: **high λ = thin/illiquid market**
-(small flow moves the price a lot), **low λ = deep/liquid**. The estimator is
-exposed as `kyle_lambda(price_changes, order_flow)` and, run on the simulated
-series, returns the same number as the adverse-selection regression slope — as
-it must, since `Cov/Var` *is* the OLS slope.
+λ is how far the price moves per unit of net flow. A high λ is a thin market
+where a little flow moves price a lot; a low λ is a deep one. `kyle_lambda(price_changes, order_flow)`
+computes it, and on the simulated series it returns the same value as the
+adverse-selection regression above. It has to, since `Cov/Var` is the regression
+slope.
 
-### Almgren-Chriss (2000) — optimal liquidation
+### Almgren-Chriss (2000): optimal liquidation
 
-Liquidating `X` shares over horizon `T` trades off two costs: **temporary
-impact** (the concession paid for trading fast) versus **timing risk** (the
-variance of holding inventory longer). Minimising `cost + λ·variance` yields a
-closed-form schedule built on hyperbolic functions:
+Selling `X` shares over a horizon `T` is a tug-of-war between two costs: temporary
+impact (you pay a concession to trade fast) and timing risk (you carry variance
+if you trade slow). Minimising `cost + λ·variance` has a closed-form solution in
+hyperbolic functions:
 
 ```
 κ̂² = λ σ² / η̃ ,   η̃ = η − ½ γ τ ,   κ = acosh(½ κ̂² τ² + 1) / τ
 x_j = X · sinh(κ (T − t_j)) / sinh(κ T)
 ```
 
-- **Risk-neutral** (`λ → 0`): `κ → 0` and the schedule is a straight line — TWAP
-  (equal slices).
-- **Risk-averse** (`λ > 0`): the schedule is **front-loaded** — sell faster
-  early to cut timing risk, accepting higher impact cost.
+- Risk-neutral (`λ → 0`): `κ → 0` and the schedule flattens to a straight line,
+  which is TWAP (equal slices).
+- Risk-averse (`λ > 0`): the schedule front-loads, selling harder early to shed
+  timing risk at the cost of more impact.
 
 ```
 risk-neutral (TWAP): kappa=0.0000
@@ -264,19 +264,19 @@ risk-averse:         kappa=1.8993
                                                         E[cost]=3.01e6  Var=1.64e10
 ```
 
-More urgency ⇒ higher κ ⇒ lower variance but higher expected cost — the
-fundamental execution trade-off, recovered exactly.
+More urgency means a higher κ, which means less variance and more expected cost.
+The schedule recovers that trade-off exactly.
 
 ---
 
 ## FIX protocol gateway
 
-Real exchanges and brokers speak **FIX** (Financial Information eXchange) — a
-flat `tag=value` wire format framed by a `BeginString` (8), `BodyLength` (9) and
-a `CheckSum` (10). The engine ships a FIX 4.2-style `FixGateway` that parses
-inbound order messages, routes them to the book, and emits the corresponding
-**ExecutionReport** (35=8) / **OrderCancelReject** (35=9) responses — the same
-shape an external trading system would exchange with a venue.
+Exchanges and brokers talk FIX (Financial Information eXchange), a flat
+`tag=value` format framed by `BeginString` (8), `BodyLength` (9), and `CheckSum`
+(10). The engine ships a FIX 4.2-style `FixGateway` that parses inbound orders,
+routes them to the book, and sends back the matching `ExecutionReport` (35=8) or
+`OrderCancelReject` (35=9), the same exchange a real trading system would have
+with a venue.
 
 Supported inbound messages:
 
@@ -298,18 +298,18 @@ gw.process("35=D|11=ORD2|54=2|38=40|40=1|", delim="|")
 #    38=40|150=2|39=2|32=40|31=100.5000|14=40|151=0|10=053|
 ```
 
-Every emitted message carries a correct `BodyLength` and `CheckSum`
-(`FixMessage::checksum_valid()` verifies inbound frames), prices are converted
-between decimal and integer ticks at the boundary, and the gateway maintains the
-`ClOrdID ↔ engine order_id` mapping required to cancel a resting order.
+Every outgoing message gets a correct `BodyLength` and `CheckSum`
+(`FixMessage::checksum_valid()` checks inbound frames), prices convert between
+decimal and integer ticks at the boundary, and the gateway keeps the
+`ClOrdID` to `engine order_id` mapping it needs to cancel a resting order.
 
 ---
 
 ## Benchmarks
 
-Measured with Google Benchmark (throughput) and a TSC cycle-counting harness
-(per-operation latency percentiles), Release build, MSVC 19.44, on a 24-core
-~2.0 GHz machine. **Your numbers will vary with hardware** — regenerate with
+Throughput comes from Google Benchmark; the latency percentiles come from a TSC
+cycle-counting harness. Release build, MSVC 19.44, on a 24-core machine at about
+2.0 GHz. These numbers move with your hardware, so regenerate them with
 `bench_book.exe`.
 
 **Throughput (Google Benchmark)**
@@ -321,7 +321,7 @@ Measured with Google Benchmark (throughput) and a TSC cycle-counting harness
 | `add_market_order` (sweep 100)  | 37.0 M orders matched/sec |
 | `add_market_order` (sweep 1000) | 41.7 M orders matched/sec |
 
-Target was 1 M+/sec; the engine clears it by ~8×.
+The target was 1 M+/sec. This clears it by roughly 8x.
 
 **Per-operation latency (nanoseconds, TSC-measured)**
 
@@ -334,16 +334,17 @@ Target was 1 M+/sec; the engine clears it by ~8×.
 | `add_market_order` depth=100 | 2655  | 3426  | 3717  | 11341  |  2738  |
 | `add_market_order` depth=1000| 23535 | 35698 | 43402 | 75123  | 25933  |
 
-Market-order latency scales linearly with the number of resting orders swept —
-exactly the O(k) you'd expect for matching k orders, with everything else O(1).
+Market-order latency grows linearly with the number of resting orders it sweeps,
+which is the O(k) you would expect for matching k orders. Everything else stays
+O(1).
 
 ---
 
 ## Getting started
 
-**Prerequisites:** a C++17 compiler, CMake ≥ 3.16, and (for the Python module)
-Python ≥ 3.8. All third-party dependencies (GoogleTest, Google Benchmark,
-pybind11) are pulled automatically via CMake `FetchContent`.
+You need a C++17 compiler, CMake 3.16 or newer, and (for the Python module)
+Python 3.8 or newer. The third-party dependencies (GoogleTest, Google Benchmark,
+pybind11) are pulled in automatically by CMake `FetchContent`.
 
 ### Build and test the C++ engine
 
@@ -367,9 +368,9 @@ pytest tests/               # Python binding tests
 python examples/demo.py     # end-to-end demo
 ```
 
-> On Windows, build from a *Developer Command Prompt* (or any shell with the
-> MSVC environment) so CMake can find the compiler, and bind against a **64-bit**
-> Python to match a 64-bit build.
+On Windows, build from a Developer Command Prompt (or any shell with the MSVC
+environment) so CMake can find the compiler, and bind against a 64-bit Python to
+match a 64-bit build.
 
 ---
 
@@ -378,7 +379,7 @@ python examples/demo.py     # end-to-end demo
 ```python
 from lob_engine import OrderBook, HawkesSimulator, MarketSimulator, kyle_lambda, almgren_chriss
 
-# --- Order book (float prices, integer-tick engine underneath) ---
+# Order book (float prices, integer-tick engine underneath)
 book = OrderBook(tick_size=0.01)
 oid  = book.add_limit_order(side='bid', price=100.50, qty=100)
 book.add_limit_order(side='ask', price=100.55, qty=150)
@@ -388,18 +389,18 @@ book.best_bid(); book.best_ask(); book.mid_price(); book.spread()
 book.depth(side='bid', levels=5)                    # [(price, volume), ...]
 book.order_book_imbalance(levels=3)                 # (bid_vol-ask_vol)/(bid_vol+ask_vol)
 
-# --- Hawkes order flow ---
+# Hawkes order flow
 mu    = [0.5, 0.5, 1.0, 1.0]            # market buy/sell, limit buy/sell
 alpha = [[0.1]*4 for _ in range(4)]     # excitation matrix (spectral radius 0.4)
 sim   = HawkesSimulator(mu=mu, alpha=alpha, beta=1.0, seed=42)
 sim.spectral_radius(); sim.stationary_intensities()
 events = sim.simulate(T=2000.0)         # [(time, 'market_buy'), ...]
 
-# --- Coupled simulation + adverse-selection regression ---
+# Coupled simulation + adverse-selection regression
 res = MarketSimulator(bucket_dt=1.0).run(hawkes=sim, T=20000.0)
 res['lambda_hat'], res['t_stat'], res['r_squared']
 
-# --- Market impact ---
+# Market impact
 kyle_lambda(price_changes=[...], order_flow=[...])
 schedule = almgren_chriss(total_shares=1_000_000, horizon=1.0, n_intervals=10,
                           sigma=0.3, eta=2.5e-6, gamma=2.5e-7, risk_aversion=1e-4)
@@ -444,9 +445,9 @@ lob-engine/
 
 ## Further reading
 
-See [`docs/theory.md`](docs/theory.md) for the deeper theory: queuing-theory
-view of a price level, the mathematics of Hawkes stationarity and Ogata
-thinning, the derivation of Kyle's λ, and the Almgren-Chriss efficient frontier.
+For the deeper theory, see [`docs/theory.md`](docs/theory.md): the queuing-theory
+view of a price level, the mathematics of Hawkes stationarity and Ogata thinning,
+the derivation of Kyle's λ, and the Almgren-Chriss efficient frontier.
 
 - Kyle, A. (1985). *Continuous Auctions and Insider Trading.* Econometrica.
 - Almgren, R. & Chriss, N. (2000). *Optimal Execution of Portfolio Transactions.* J. Risk.
