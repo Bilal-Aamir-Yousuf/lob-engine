@@ -82,7 +82,7 @@ struct PriceLevel {
         ++order_count;
     }
 
-    // Splice an order out of the list. Does NOT touch total_volume — callers
+    // Splice an order out of the list. Does NOT touch total_volume; callers
     // adjust volume explicitly (matching decrements as it trades; cancel
     // subtracts the remaining quantity first). This keeps the volume
     // accounting in one place per operation.
