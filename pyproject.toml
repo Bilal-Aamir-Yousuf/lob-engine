@@ -1,0 +1,31 @@
+[build-system]
+requires = ["scikit-build-core>=0.8"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "lob_engine"
+version = "0.1.0"
+description = "High-frequency C++ limit order book engine with Hawkes order-flow simulation and market-impact models"
+readme = "README.md"
+requires-python = ">=3.8"
+authors = [{ name = "Bilal Aamir" }]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+# Drive the existing CMakeLists: build only the Python module, skip C++ tests.
+cmake.version = ">=3.16"
+cmake.args = ["-DLOB_BUILD_PYTHON=ON", "-DLOB_BUILD_TESTS=OFF"]
+cmake.build-type = "Release"
+wheel.expand-macos-universal-tags = false
+
+[tool.scikit-build.cmake.define]
+LOB_BUILD_PYTHON = "ON"
+LOB_BUILD_TESTS = "OFF"

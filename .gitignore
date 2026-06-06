@@ -1,0 +1,28 @@
+# Build output
+build/
+out/
+cmake-build-*/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.stamp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.so
+*.pyd
+.venv/
+venv/
+dist/
+*.whl
+
+# Editor / OS
+.vscode/
+.idea/
+*.user
+.DS_Store
+Thumbs.db
