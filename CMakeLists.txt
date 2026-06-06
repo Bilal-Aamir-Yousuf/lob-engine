@@ -33,6 +33,10 @@ add_library(lob_core
 target_include_directories(lob_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_features(lob_core PUBLIC cxx_std_17)
 
+# Required on Linux: this static lib is linked into the pybind11 shared module,
+# and every object in a .so must be position-independent. No-op on MSVC.
+set_target_properties(lob_core PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 if(MSVC)
     target_compile_options(lob_core PRIVATE /O2 /W4)
 else()
